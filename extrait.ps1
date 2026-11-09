@@ -1,6 +1,5 @@
 # Interactive video clip tool. Run: powershell -ExecutionPolicy Bypass -File extrait.ps1
-$defaultBin = "C:\Users\crousseau\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.0.1-full_build\bin"
-$outDir     = "E:\Downloads\ffmpeg-split\extraits"
+$configFile = Join-Path $PSScriptRoot "config.json"   # saved paths (ffmpeg, output folder), not committed
 $font       = "C\:/Windows/Fonts/arial.ttf"
 $inv        = [Globalization.CultureInfo]::InvariantCulture
 $utf8       = New-Object System.Text.UTF8Encoding($false)
@@ -13,19 +12,32 @@ function Ask($q, $default) {
   return $a.Trim()
 }
 
-# Finds an exe: default folder, then PATH, then asks (accepts the exe path or its folder).
-function Find-Tool([string]$exe) {
-  $cand = Join-Path $defaultBin $exe
-  if (Test-Path -LiteralPath $cand) { return $cand }
-  $cmd = Get-Command $exe -ErrorAction SilentlyContinue
-  if ($cmd) { return $cmd.Source }
-  Write-Host "$exe not found in the default location or in PATH." -ForegroundColor Yellow
+$config = @{}
+if (Test-Path -LiteralPath $configFile) {
+  try { (Get-Content -LiteralPath $configFile -Raw -Encoding UTF8 | ConvertFrom-Json).PSObject.Properties | ForEach-Object { $config[$_.Name] = $_.Value } } catch {}
+}
+function Save-Config { $config | ConvertTo-Json | Set-Content -LiteralPath $configFile -Encoding UTF8 }
+
+# Asks for a path. With a saved (or detected) value, Enter keeps it; typing a path replaces it.
+# $isValid receives the cleaned input and returns the final path, or $null if invalid.
+function Ask-Path([string]$label, [string]$suggested, [scriptblock]$isValid) {
   while ($true) {
-    $p = Clean (Read-Host "Path to $exe (or to the folder containing it)")
-    if (Test-Path -LiteralPath $p -PathType Container) { $p = Join-Path $p $exe }
-    if (Test-Path -LiteralPath $p -PathType Leaf) { return $p }
-    Write-Host "Not found." -ForegroundColor Yellow
+    $prompt = if ($suggested) { "$label [$suggested] (Enter = keep, or type a new path)" } else { $label }
+    $in = Clean (Read-Host $prompt)
+    if ($in -eq "") { $in = $suggested }
+    if ($in -ne "") {
+      $r = & $isValid $in
+      if ($r) { return $r }
+    }
+    Write-Host "Invalid or not found, try again." -ForegroundColor Yellow
   }
+}
+
+# Accepts the exe path or the folder containing it.
+function Resolve-Exe([string]$p, [string]$exe) {
+  if (Test-Path -LiteralPath $p -PathType Container) { $p = Join-Path $p $exe }
+  if (Test-Path -LiteralPath $p -PathType Leaf) { return $p }
+  return $null
 }
 
 function ToSeconds([string]$t) {
@@ -36,11 +48,23 @@ function ToSeconds([string]$t) {
 function Fmt([double]$s) { return [TimeSpan]::FromSeconds($s).ToString('hh\:mm\:ss') }
 function Num([double]$n) { return $n.ToString('0.###', $inv) }
 
-$ffmpeg  = Find-Tool "ffmpeg.exe"
-$ffprobe = Join-Path (Split-Path $ffmpeg) "ffprobe.exe"
-if (-not (Test-Path -LiteralPath $ffprobe)) { $ffprobe = Find-Tool "ffprobe.exe" }
+# Settings: saved value (or ffmpeg found in PATH) is offered as the default
+$sugg = if ($config.ffmpeg) { $config.ffmpeg } else { (Get-Command ffmpeg.exe -ErrorAction SilentlyContinue).Source }
+$ffmpeg = Ask-Path "Path to ffmpeg.exe (or its folder)" $sugg { param($p) Resolve-Exe $p "ffmpeg.exe" }
 
-New-Item -ItemType Directory -Force $outDir | Out-Null
+$ffprobe = Join-Path (Split-Path $ffmpeg) "ffprobe.exe"
+if (-not (Test-Path -LiteralPath $ffprobe)) {
+  $ffprobe = Ask-Path "Path to ffprobe.exe (or its folder)" (Get-Command ffprobe.exe -ErrorAction SilentlyContinue).Source { param($p) Resolve-Exe $p "ffprobe.exe" }
+}
+
+$outDir = Ask-Path "Output folder for the clips" $config.outDir {
+  param($p)
+  try { New-Item -ItemType Directory -Force -Path $p -ErrorAction Stop | Out-Null; return $p } catch { return $null }
+}
+
+$config.ffmpeg = $ffmpeg
+$config.outDir = $outDir
+Save-Config
 
 function Invoke-Part($src, $p) {
   $reenc = ($p.Title -ne "") -or $p.Fade
